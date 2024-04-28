@@ -1,5 +1,8 @@
-use axum::routing::get_service;
-use reqwest::Url;
+use axum::extract::{Path as ExtractPath, Request};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Redirect};
+use axum::routing::{any, get_service};
+use reqwest::{header, StatusCode, Url};
 use std::net::SocketAddr;
 use std::path::Path;
 use tokio::sync::oneshot;
@@ -25,7 +28,16 @@ impl StaticDirectoryServer {
         let service = get_service(ServeDir::new(path));
 
         // Create a router that will serve the static files
-        let app = axum::Router::new().nest_service("/", service);
+        let app = axum::Router::new()
+            .nest_service("/", service)
+            .route(
+                "/redirect-method",
+                any(StaticDirectoryServer::redirect_method),
+            )
+            .route(
+                "/only-works-with-method/:method",
+                any(StaticDirectoryServer::method_matcher),
+            );
 
         // Construct the server that will listen on localhost but with a *random port*. The random
         // port is very important because it enables creating multiple instances at the same time.
@@ -52,6 +64,35 @@ impl StaticDirectoryServer {
             local_addr: addr,
             shutdown_sender: Some(tx),
         })
+    }
+
+    // Redirects to a URL that contains the HTTP method used in the request.
+    async fn redirect_method<B>(r: Request<B>) -> Redirect {
+        let method = r.method().to_string();
+        let destination = format!("/only-works-with-method/{}", method);
+        Redirect::temporary(&destination)
+    }
+
+    // Responds with 206 Partial Content if the method matches the one in the path, otherwise
+    // 405 Method Not Allowed
+    async fn method_matcher<B>(
+        ExtractPath(method): ExtractPath<String>,
+        r: Request<B>,
+    ) -> impl IntoResponse {
+        let mut headers = HeaderMap::new();
+        if method != r.method().as_str() {
+            let empty: &[u8] = &[];
+            return (StatusCode::METHOD_NOT_ALLOWED, headers, empty);
+        }
+
+        headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        let bytes: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9];
+        headers.insert(header::CONTENT_LENGTH, bytes.len().into());
+        (StatusCode::PARTIAL_CONTENT, headers, bytes)
     }
 }
 
