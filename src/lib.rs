@@ -714,7 +714,7 @@ mod test {
     use reqwest::{Client, StatusCode};
     use rstest::*;
     use std::path::Path;
-    use tokio::{fs::File, io::AsyncReadExt as _};
+    use tokio::io::AsyncReadExt as _;
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
     #[rstest]
@@ -855,7 +855,10 @@ mod test {
         assert_range_and_file_contents_match(range, file).await;
     }
 
-    async fn assert_range_and_file_contents_match(mut range: AsyncHttpRangeReader, mut file: File) {
+    async fn assert_range_and_file_contents_match<T: AsyncRead + std::marker::Unpin>(
+        mut range: AsyncHttpRangeReader,
+        mut file: T,
+    ) {
         // Read until the end and make sure that the contents matches
         let mut range_read = vec![0; 64 * 1024];
         let mut file_read = vec![0; 64 * 1024];
@@ -963,5 +966,64 @@ mod test {
             result,
             Err(AsyncHttpRangeReaderBuilderError::InvalidContentLength)
         );
+    }
+
+    #[tokio::test]
+    async fn test_builder_fails_when_head_response_url_cannot_be_used_with_get() {
+        let path = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("test-data");
+        let server = StaticDirectoryServer::new(&path)
+            .await
+            .expect("could not initialize server");
+
+        // This is a special test url. When called with a HEAD request, it will redirect to
+        // /only-works-with-method/HEAD, and GET redirects to /only-works-with-method/GET.
+        // When either of these urls are called, they will return a 405 Method Not Allowed unless
+        // that method matches the last part of the url.
+        // Certain URLs in the wild act like this, for example Amazon S3 pre-signed URLs which
+        // contain the HTTP method in the signature that's part of the URL.
+        let url = server.url().join("redirect-method").unwrap();
+
+        let head_response = Client::new()
+            .head(url.clone())
+            .send()
+            .await
+            .expect("could not perform head request");
+
+        // So when we build a reader and use the URL from this head response...
+        let mut reader = AsyncHttpRangeReader::builder(Client::new().into())
+            .from_head_response(head_response)
+            .expect("could not build reader from head response")
+            .build()
+            .expect("could not build reader");
+
+        let mut range_read = vec![0; 9];
+
+        // ...we should get a 405 Method Not Allowed error.
+        let err = reader.read(&mut range_read).await.unwrap_err();
+        assert!(err.to_string().contains("405 Method Not Allowed"));
+
+        // However...
+        let head_response = Client::new()
+            .head(url.clone())
+            .send()
+            .await
+            .expect("could not perform head request");
+
+        // If we construct our reader specifying .url(url) after the from_head_response...
+        let mut reader = AsyncHttpRangeReader::builder(Client::new().into())
+            .from_head_response(head_response)
+            .expect("could not build reader from head response")
+            .url(url)
+            .build()
+            .expect("could not build reader");
+
+        // We should be able to read the file just fine
+        let mut range_read = vec![0; 9];
+        let read_data = reader.read(&mut range_read).await.unwrap();
+        assert_eq!(read_data, 9);
+
+        // This special test URL just returns a static array.
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert_eq!(range_read, data);
     }
 }
